@@ -9,9 +9,8 @@ and stores them in a Chroma vector database.
 import os
 import argparse
 import logging
-from typing import Optional, List
+from typing import Optional
 
-import chromadb
 from chromadb.config import Settings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter

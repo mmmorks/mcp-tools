@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+PDF to Chroma Importer with TOC-based Semantic Chunking and Incremental Processing
+
+This script loads PDFs, extracts the table of contents, splits the document into
+semantic chunks based on the TOC structure, creates embeddings using Amazon Bedrock,
+and incrementally stores them in a Chroma vector database with detailed progress reporting.
+"""
+
+import os
+import argparse
+import logging
+import time
+from typing import Optional, List, Dict, Tuple
+import re
+from datetime import datetime
+
+import chromadb
+from chromadb.config import Settings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_aws import BedrockEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_core.documents import Document
+
+import fitz  # PyMuPDF
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def extract_toc(pdf_path: str) -> List[Dict]:
+    """Extract table of contents from PDF with page numbers."""
+    logger.info(f"Extracting table of contents from {pdf_path}")
+    doc = fitz.open(pdf_path)
+    toc = doc.get_toc()
+    
+    # Format: [[level, title, page, ...], ...]
+    formatted_toc = []
+    for entry in toc:
+        level, title, page = entry[:3]
+        formatted_toc.append({
+            "level": level,
+            "title": title,
+            "page": page
+        })
+    
+    logger.info(f"Extracted {len(formatted_toc)} TOC entries")
+    return formatted_toc
+
+def create_semantic_chunks(pdf_path: str, toc: List[Dict], min_chunk_size: int = 500) -> List[Document]:
+    """Create semantic chunks based on TOC structure."""
+    logger.info("Creating semantic chunks based on TOC structure")
+    start_time = time.time()
+    
+    # Load the PDF
+    doc = fitz.open(pdf_path)
+    total_pages = len(doc)
+    logger.info(f"PDF has {total_pages} pages")
+    
+    # Sort TOC by page number
+    toc_sorted = sorted(toc, key=lambda x: x["page"])
+    
+    # Create page ranges for each section
+    sections = []
+    for i in range(len(toc_sorted)):
+        start_page = toc_sorted[i]["page"] - 1  # Convert from 1-indexed to 0-indexed
+        
+        # End page is either the start of the next section or the end of the document
+        end_page = toc_sorted[i+1]["page"] - 1 if i < len(toc_sorted) - 1 else total_pages - 1
+        
+        sections.append({
+            "title": toc_sorted[i]["title"],
+            "level": toc_sorted[i]["level"],
+            "start_page": start_page,
+            "end_page": end_page
+        })
+    
+    logger.info(f"Created {len(sections)} section definitions from TOC")
+    
+    # Create chunks based on sections
+    chunks = []
+    total_sections = len(sections)
+    
+    for idx, section in enumerate(sections):
+        # Log progress
+        if idx % 10 == 0 or idx == total_sections - 1:
+            logger.info(f"Processing section {idx+1}/{total_sections} ({(idx+1)/total_sections*100:.1f}%)")
+        
+        # Extract text from the section's pages
+        section_text = ""
+        for page_num in range(section["start_page"], section["end_page"] + 1):
+            page = doc[page_num]
+            section_text += page.get_text()
+        
+        # Create section path for hierarchical context
+        section_path = section["title"]
+        
+        # If section is too large, split it further
+        if len(section_text) > min_chunk_size * 2:  # Reduced threshold for large sections
+            logger.debug(f"Section '{section['title']}' is large ({len(section_text)} chars), splitting further")
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=min_chunk_size,
+                chunk_overlap=min(300, min_chunk_size // 5)
+            )
+            sub_chunks = text_splitter.create_documents(
+                [section_text], 
+                metadatas=[{
+                    "title": section["title"],
+                    "level": section["level"],
+                    "page_range": f"{section['start_page']+1}-{section['end_page']+1}",
+                    "section_path": section_path
+                }]
+            )
+            chunks.extend(sub_chunks)
+        else:
+            # Keep small sections as single chunks
+            chunks.append(Document(
+                page_content=section_text,
+                metadata={
+                    "title": section["title"],
+                    "level": section["level"],
+                    "page_range": f"{section['start_page']+1}-{section['end_page']+1}",
+                    "section_path": section_path
+                }
+            ))
+    
+    elapsed = time.time() - start_time
+    logger.info(f"Created {len(chunks)} semantic chunks based on TOC structure in {elapsed:.2f} seconds")
+    return chunks
+
+def add_to_chroma_incrementally(chunks, collection_name: str, persist_dir: str,
+                              model_id: str, region_name: str, batch_size: int = 10,
+                              aws_profile: Optional[str] = None):
+    """Create embeddings with Bedrock and store in Chroma incrementally."""
+    logger.info(f"Initializing Bedrock embeddings with model {model_id} in region {region_name}")
+    start_time = time.time()
+
+    # Initialize Bedrock embeddings
+    bedrock_kwargs = {
+        "model_id": model_id,
+        "region_name": region_name
+    }
+
+    if aws_profile:
+        bedrock_kwargs["credentials_profile_name"] = aws_profile
+        logger.info(f"Using AWS profile: {aws_profile}")
+
+    bedrock_embeddings = BedrockEmbeddings(**bedrock_kwargs)
+
+    # Initialize Chroma client
+    client = chromadb.PersistentClient(path=persist_dir)
+    
+    # Get or create collection
+    try:
+        collection = client.get_collection(name=collection_name)
+        logger.info(f"Using existing collection: {collection_name}")
+    except:
+        collection = client.create_collection(name=collection_name)
+        logger.info(f"Created new collection: {collection_name}")
+    
+    # Process chunks in batches
+    total_chunks = len(chunks)
+    total_batches = (total_chunks - 1) // batch_size + 1
+    successful_chunks = 0
+    failed_chunks = 0
+    
+    logger.info(f"Processing {total_chunks} chunks in {total_batches} batches (batch size: {batch_size})")
+    
+    for i in range(0, total_chunks, batch_size):
+        batch = chunks[i:i+batch_size]
+        end_idx = min(i+batch_size, total_chunks)
+        batch_num = i//batch_size + 1
+        
+        batch_start_time = time.time()
+        logger.info(f"Processing batch {batch_num}/{total_batches} (chunks {i+1}-{end_idx} of {total_chunks})")
+        
+        # Create IDs for the documents
+        timestamp = int(time.time() * 1000)
+        ids = [f"doc_{timestamp}_{j}" for j in range(i, end_idx)]
+        
+        # Extract text and metadata
+        texts = [doc.page_content for doc in batch]
+        metadatas = [doc.metadata for doc in batch]
+        
+        # Generate embeddings and add to collection
+        try:
+            logger.info(f"Generating embeddings for batch {batch_num}...")
+            embedding_start = time.time()
+            embeddings = bedrock_embeddings.embed_documents(texts)
+            embedding_time = time.time() - embedding_start
+            logger.info(f"Embeddings generated in {embedding_time:.2f} seconds")
+            
+            logger.info(f"Adding documents to Chroma collection...")
+            add_start = time.time()
+            collection.add(
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            add_time = time.time() - add_start
+            logger.info(f"Documents added in {add_time:.2f} seconds")
+            
+            successful_chunks += len(batch)
+            
+            batch_time = time.time() - batch_start_time
+            logger.info(f"Batch {batch_num}/{total_batches} completed in {batch_time:.2f} seconds")
+            
+            # Estimate remaining time
+            avg_time_per_batch = (time.time() - start_time) / batch_num
+            remaining_batches = total_batches - batch_num
+            est_remaining_time = avg_time_per_batch * remaining_batches
+            
+            # Format as hours:minutes:seconds
+            est_completion_time = datetime.now().timestamp() + est_remaining_time
+            est_completion_str = datetime.fromtimestamp(est_completion_time).strftime('%H:%M:%S')
+            
+            logger.info(f"Progress: {batch_num}/{total_batches} batches ({batch_num/total_batches*100:.1f}%)")
+            logger.info(f"Estimated time remaining: {est_remaining_time/60:.1f} minutes (completion around {est_completion_str})")
+            
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_num}: {str(e)}")
+            failed_chunks += len(batch)
+            # Continue with next batch instead of failing completely
+            continue
+    
+    total_time = time.time() - start_time
+    logger.info(f"Processing completed in {total_time:.2f} seconds")
+    logger.info(f"Successfully added {successful_chunks} chunks to Chroma collection '{collection_name}'")
+    
+    if failed_chunks > 0:
+        logger.warning(f"Failed to process {failed_chunks} chunks")
+    
+    return collection
+
+def main():
+    """Main function to parse arguments and run the script."""
+    parser = argparse.ArgumentParser(
+        description="Import PDFs to Chroma using TOC-based semantic chunking and Amazon Bedrock embeddings"
+    )
+
+    parser.add_argument(
+        "--pdf", "-p",
+        required=True,
+        help="Path to the PDF file to import"
+    )
+
+    parser.add_argument(
+        "--collection", "-c",
+        default="pdf_collection",
+        help="Name of the Chroma collection (default: pdf_collection)"
+    )
+
+    parser.add_argument(
+        "--persist-dir", "-d",
+        default="./chroma_db",
+        help="Directory to persist the Chroma database (default: ./chroma_db)"
+    )
+
+    parser.add_argument(
+        "--min-chunk-size",
+        type=int,
+        default=2000,
+        help="Minimum size for text chunks (default: 2000)"
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of documents to process in each batch (default: 10)"
+    )
+
+    parser.add_argument(
+        "--model-id",
+        default="amazon.titan-embed-text-v1",
+        choices=["amazon.titan-embed-text-v1", "cohere.embed-english-v3", "cohere.embed-multilingual-v3"],
+        help="Bedrock embedding model ID (default: amazon.titan-embed-text-v1)"
+    )
+
+    parser.add_argument(
+        "--region",
+        default="us-east-1",
+        help="AWS region for Bedrock (default: us-east-1)"
+    )
+
+    parser.add_argument(
+        "--profile",
+        help="AWS profile name (optional)"
+    )
+
+    parser.add_argument(
+        "--fallback-to-standard",
+        action="store_true",
+        help="Fallback to standard chunking if TOC extraction fails"
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+
+    args = parser.parse_args()
+
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        # Check if PDF exists
+        if not os.path.isfile(args.pdf):
+            logger.error(f"PDF file not found: {args.pdf}")
+            return 1
+
+        # Create persist directory if it doesn't exist
+        os.makedirs(args.persist_dir, exist_ok=True)
+
+        # Extract TOC and create semantic chunks
+        try:
+            logger.info(f"Starting TOC extraction from {args.pdf}")
+            toc = extract_toc(args.pdf)
+            
+            if not toc and args.fallback_to_standard:
+                logger.warning("No TOC found, falling back to standard chunking")
+                logger.info("Loading PDF with PyPDFLoader...")
+                documents = PyPDFLoader(args.pdf).load()
+                logger.info(f"Loaded {len(documents)} pages, applying standard chunking...")
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=args.min_chunk_size,
+                    chunk_overlap=min(300, args.min_chunk_size // 5)
+                )
+                chunks = text_splitter.split_documents(documents)
+                logger.info(f"Created {len(chunks)} chunks with standard chunking")
+            else:
+                logger.info(f"Creating semantic chunks based on {len(toc)} TOC entries...")
+                chunks = create_semantic_chunks(args.pdf, toc, args.min_chunk_size)
+        except Exception as e:
+            if args.fallback_to_standard:
+                logger.warning(f"TOC extraction failed: {str(e)}. Falling back to standard chunking")
+                logger.info("Loading PDF with PyPDFLoader...")
+                documents = PyPDFLoader(args.pdf).load()
+                logger.info(f"Loaded {len(documents)} pages, applying standard chunking...")
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=args.min_chunk_size,
+                    chunk_overlap=min(300, args.min_chunk_size // 5)
+                )
+                chunks = text_splitter.split_documents(documents)
+                logger.info(f"Created {len(chunks)} chunks with standard chunking")
+            else:
+                raise
+
+        # Add chunks to Chroma incrementally
+        logger.info(f"Beginning incremental addition to Chroma with batch size {args.batch_size}...")
+        add_to_chroma_incrementally(
+            chunks,
+            args.collection,
+            args.persist_dir,
+            args.model_id,
+            args.region,
+            args.batch_size,
+            args.profile
+        )
+
+        logger.info("PDF successfully imported to Chroma with semantic chunking.")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error importing PDF: {str(e)}", exc_info=True)
+        return 1
+
+if __name__ == "__main__":
+    exit(main())
