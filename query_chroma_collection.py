@@ -1,4 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "boto3>=1.37.24",
+#     "chromadb>=0.4.18",
+#     "langchain>=0.0.267",
+#     "langchain-aws>=0.2.22",
+#     "langchain-community>=0.0.10",
+#     "langchain-core>=0.3.56",
+#     "pydantic>=2.4.2",
+#     "pymupdf>=1.23.7",
+#     "pypdf>=3.15.1",
+# ]
+# ///
 """
 Chroma Collection Query Module
 
@@ -16,7 +30,6 @@ The module can be used:
 import argparse
 import logging
 import json
-import sys
 from typing import List, Dict, Any, Optional, Union, Tuple
 
 import chromadb
@@ -37,7 +50,7 @@ class ChromaCollectionQuerier:
         collection_name: str = "pdf_collection",
         persist_dir: str = "./chroma_db",
         model_id: str = "amazon.titan-embed-text-v1",
-        region: str = "us-east-1",
+        region: str = "us-west-2",
         aws_profile: Optional[str] = None
     ):
         """Initialize the ChromaCollectionQuerier with embedding model and collection."""
