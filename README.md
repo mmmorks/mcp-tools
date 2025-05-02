@@ -1,34 +1,135 @@
-# MCP Tools
+# Chroma Importer
 
-A collection of tools for MCP (Model Context Protocol) operations.
-
-## Overview
-
-This repository contains utilities and tools for working with Model Context Protocol, focusing on document processing and vector database integration.
+A modular package for importing different document formats into ChromaDB with Amazon Bedrock embeddings. This package provides a unified interface for processing and storing various document types, while preserving their semantic structure.
 
 ## Features
 
-### import-pdf-to-chroma-v2
-This tool allows you to import PDF documents into a Chroma vector database. It processes PDF content and stores it as embeddings in Chroma, using Amazon Bedrock for generating the embeddings.
+- **Modular Architecture**: Clean separation between document processing and vector database operations
+- **Multiple Format Support**: Currently supports PDF files and Javadoc directories
+- **Semantic Chunking**: Preserves document structure for better search results
+  - PDF: TOC-based semantic chunking
+  - Javadoc: Package/class/method hierarchy preservation
+- **Incremental Processing**: Efficient batch processing with progress reporting
+- **Unified CLI**: Single command-line interface with format-specific subcommands
 
-### mcp-chroma-query.py
-This program enables querying the Chroma vector database through an MCP (Model Context Protocol) integration. It connects your vector database to the LLM of your choice, allowing for semantic search and retrieval of document content.
-
-These tools create a complete workflow for document processing, embedding generation, and retrieval augmented generation (RAG) using the Chroma vector database (https://docs.trychroma.com/docs/overview/getting-started) and Amazon Bedrock.
-
-## Getting Started
+## Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/mmmorks/mcp-tools.git
-cd mcp-tools
+# From the repository
+pip install .
 
-# Install uv (dependency manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install Chroma using uv
-uv pip install chromadb
+# Or using direct path
+pip install /path/to/chroma-importer
 ```
+
+## Usage
+
+### Command-line Interface
+
+The package provides a unified `chroma-import` command with subcommands for different document formats.
+
+#### Importing PDF Files
+
+```bash
+# Basic usage
+chroma-import pdf --pdf path/to/document.pdf
+
+# Advanced options
+chroma-import pdf \
+  --pdf path/to/document.pdf \
+  --collection my_pdf_collection \
+  --persist-dir ./my_chroma_db \
+  --min-chunk-size 1500 \
+  --fallback-to-standard \
+  --model-id amazon.titan-embed-text-v1 \
+  --region us-east-1 \
+  --profile my-aws-profile \
+  --batch-size 20 \
+  --verbose
+```
+
+#### Importing Javadoc Directories
+
+```bash
+# Basic usage
+chroma-import javadoc --javadoc path/to/javadoc
+
+# Advanced options
+chroma-import javadoc \
+  --javadoc path/to/javadoc \
+  --collection my_javadoc_collection \
+  --persist-dir ./my_chroma_db \
+  --model-id cohere.embed-english-v3 \
+  --region us-west-2 \
+  --profile my-aws-profile \
+  --batch-size 15 \
+  --verbose
+```
+
+### Python API
+
+You can also use the package's Python API directly:
+
+```python
+from chroma_importer.core import ChromaManager
+from chroma_importer.processors import PDFProcessor, JavadocProcessor
+
+# Process a PDF file
+pdf_processor = PDFProcessor(
+    "path/to/document.pdf",
+    min_chunk_size=2000,
+    fallback_to_standard=True
+)
+pdf_documents = pdf_processor.process_and_validate()
+
+# Process a Javadoc directory
+javadoc_processor = JavadocProcessor("path/to/javadoc")
+javadoc_documents = javadoc_processor.process_and_validate()
+
+# Store documents in ChromaDB
+chroma_manager = ChromaManager(
+    "./chroma_db",
+    "amazon.titan-embed-text-v1",
+    "us-east-1"
+)
+
+# Add documents incrementally
+chroma_manager.add_documents_incrementally(
+    pdf_documents,
+    "pdf_collection",
+    batch_size=10
+)
+```
+
+## Architecture
+
+The package follows a modular architecture with clear separation of concerns:
+
+```
+chroma_importer/
+  ├── core/                # Core components and base classes
+  │   ├── base_processor.py  # Abstract base class for document processors
+  │   └── chroma_manager.py  # ChromaDB and embedding management
+  └── processors/         # Format-specific document processors
+      ├── pdf_processor.py   # PDF processing with TOC-based chunking
+      └── javadoc_processor.py  # Javadoc HTML processing
+```
+
+### Document Processing Pipeline
+
+1. **Format-specific Processing**: Each processor handles the specifics of parsing its document format
+2. **Document Validation**: Ensures all documents have valid content and metadata
+3. **Metadata Enrichment**: Adds standard fields like source type and processing timestamp
+4. **Embedding Generation**: Creates embeddings using Amazon Bedrock
+5. **Incremental Storage**: Stores documents in batches with detailed progress reporting
+
+## Requirements
+
+- Python 3.8+
+- AWS Account with Bedrock access
+- Supported formats:
+  - PDF: Any valid PDF file
+  - Javadoc: HTML documentation generated by Javadoc tool
 
 ## License
 

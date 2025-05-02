@@ -11,16 +11,13 @@ import os
 import argparse
 import logging
 import time
-from typing import Optional, List, Dict, Tuple
-import re
+from typing import Optional, List, Dict
 from datetime import datetime
 
 import chromadb
-from chromadb.config import Settings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_aws import BedrockEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 
 import fitz  # PyMuPDF

@@ -1,0 +1,669 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "boto3>=1.37.24",
+#     "chromadb>=0.4.18",
+#     "langchain>=0.0.267",
+#     "langchain-aws>=0.2.22",
+#     "langchain-community>=0.0.10", 
+#     "langchain-core>=0.3.56",
+#     "pydantic>=2.4.2",
+#     "beautifulsoup4>=4.12.2",
+#     "html5lib>=1.1",
+# ]
+# ///
+"""
+Javadoc to Chroma Importer
+
+This script traverses a Javadoc directory structure, extracts content from HTML files,
+preserves semantic relationships (packages, classes, methods), creates embeddings
+using Amazon Bedrock, and stores them in a Chroma vector database with detailed metadata.
+"""
+
+import os
+import re
+import argparse
+import logging
+import time
+import json
+from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import chromadb
+from bs4 import BeautifulSoup
+from langchain_aws import BedrockEmbeddings
+from langchain_core.documents import Document
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+class JavadocProcessor:
+    """Process Javadoc HTML files and extract structured content."""
+    
+    def __init__(self, javadoc_path: str):
+        """Initialize processor with path to javadoc directory."""
+        self.javadoc_path = Path(javadoc_path)
+        if not self.javadoc_path.exists() or not self.javadoc_path.is_dir():
+            raise ValueError(f"Javadoc path {javadoc_path} does not exist or is not a directory")
+        
+        # Check if this looks like a Javadoc structure
+        index_html = self.javadoc_path / "index.html"
+        if not index_html.exists():
+            raise ValueError(f"No index.html found in {javadoc_path}, doesn't appear to be a Javadoc directory")
+            
+        logger.info(f"Initialized Javadoc processor for {javadoc_path}")
+    
+    def get_all_html_files(self) -> List[Path]:
+        """Get all HTML files in the Javadoc directory."""
+        html_files = []
+        for path in self.javadoc_path.glob("**/*.html"):
+            if not path.is_file():
+                continue
+                
+            # Skip index-all.html, deprecated-list.html, etc.
+            if path.name.startswith(("index-", "deprecated", "help-doc", 
+                                      "overview-tree", "overview-summary",
+                                      "allclasses", "allpackages", "constant-values")):
+                continue
+                
+            html_files.append(path)
+        
+        logger.info(f"Found {len(html_files)} HTML files for processing")
+        return html_files
+    
+    def extract_package_structure(self) -> Dict[str, List[Path]]:
+        """Extract package structure from Javadoc."""
+        package_files = {}
+        all_html_files = self.get_all_html_files()
+        
+        # Find package-summary.html files to identify packages
+        package_summaries = [f for f in all_html_files if f.name == "package-summary.html"]
+        
+        for package_file in package_summaries:
+            # The parent directory name is the package name
+            package_path = package_file.parent
+            package_name = self._extract_package_name(package_file)
+            
+            # Find all HTML files in this package
+            package_files[package_name] = [
+                f for f in all_html_files 
+                if f.parent == package_path and f.name != "package-summary.html"
+            ]
+        
+        logger.info(f"Extracted structure for {len(package_files)} packages")
+        return package_files
+    
+    def _extract_package_name(self, package_file: Path) -> str:
+        """Extract package name from package-summary.html."""
+        try:
+            with open(package_file, 'r', encoding='utf-8') as f:
+                soup = BeautifulSoup(f.read(), 'html5lib')
+                
+                # Try to find package name from header
+                header = soup.select_one("div.header h1.title")
+                if header:
+                    # Extract package name from "Package packagename"
+                    package_text = header.text.strip()
+                    if package_text.startswith("Package "):
+                        return package_text[8:].strip()
+                
+                # Fallback: extract from the file path
+                rel_path = package_file.parent.relative_to(self.javadoc_path)
+                package_parts = []
+                
+                # If there's a multi-level directory, convert to package name
+                for part in rel_path.parts:
+                    # Skip common doc structure directories
+                    if part in ["api", "javadoc", "docs"]:
+                        continue
+                    package_parts.append(part)
+                
+                if package_parts:
+                    return ".".join(package_parts)
+                
+                # If we can't determine a package name
+                return "(default package)"
+                
+        except Exception as e:
+            logger.warning(f"Error extracting package name from {package_file}: {e}")
+            return f"unknown_package_{package_file.parent.name}"
+    
+    def process_file(self, file_path: Path, package_name: str) -> List[Document]:
+        """Process a single Javadoc HTML file and extract documents."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            soup = BeautifulSoup(content, 'html5lib')
+            documents = []
+            
+            # Determine file type (class, interface, enum, etc.)
+            file_type = self._determine_file_type(soup)
+            class_name = file_path.stem
+            
+            # Get class summary
+            class_doc = self._extract_class_documentation(soup, class_name, package_name, file_type)
+            if class_doc:
+                documents.append(class_doc)
+            
+            # Get method documentation
+            method_docs = self._extract_methods_documentation(soup, class_name, package_name, file_type)
+            documents.extend(method_docs)
+            
+            # Get field documentation
+            field_docs = self._extract_fields_documentation(soup, class_name, package_name, file_type)
+            documents.extend(field_docs)
+            
+            logger.debug(f"Extracted {len(documents)} document chunks from {file_path}")
+            return documents
+            
+        except Exception as e:
+            logger.error(f"Error processing {file_path}: {e}")
+            return []
+    
+    def _determine_file_type(self, soup: BeautifulSoup) -> str:
+        """Determine the file type (class, interface, enum)."""
+        # Check the title or header for the file type
+        header = soup.select_one("div.header h1.title, div.title")
+        if header:
+            text = header.text.strip().lower()
+            if "interface" in text:
+                return "interface"
+            elif "enum" in text:
+                return "enum"
+            elif "annotation" in text:
+                return "annotation"
+            elif "class" in text:
+                return "class"
+            
+        # Look for specific indicators
+        if soup.select_one(".interfaceName"):
+            return "interface"
+        elif soup.select_one(".enumDescription"):
+            return "enum"
+        elif soup.select_one(".annotationDescription"):
+            return "annotation"
+            
+        # Default to class
+        return "class"
+    
+    def _extract_class_documentation(self, soup: BeautifulSoup, class_name: str, 
+                                    package_name: str, file_type: str) -> Optional[Document]:
+        """Extract class/interface summary documentation."""
+        # Get the class description
+        class_description = soup.select_one("div.description div.block, div.contentContainer div.description div.block")
+        if not class_description:
+            class_description = soup.select_one("div.classSummary div.block")
+            
+        # Get inheritance information
+        inheritance_section = soup.select_one("div.inheritance, ul.inheritance")
+        inheritance = ""
+        if inheritance_section:
+            inheritance = " ".join(inheritance_section.text.strip().split())
+            
+        # Check if deprecated
+        deprecated_section = soup.select_one("div.deprecatedContent")
+        deprecated_note = ""
+        if deprecated_section:
+            deprecated_note = "DEPRECATED: " + " ".join(deprecated_section.text.strip().split())
+            
+        # Combine information
+        content = f"{file_type.upper()}: {class_name}\n\n"
+        
+        if class_description:
+            content += class_description.text.strip() + "\n\n"
+            
+        if inheritance:
+            content += f"Inheritance: {inheritance}\n\n"
+            
+        if deprecated_note:
+            content += f"{deprecated_note}\n\n"
+            
+        # Only create a document if we have actual content
+        if len(content.strip()) > len(f"{file_type.upper()}: {class_name}"):
+            return Document(
+                page_content=content,
+                metadata={
+                    "package": package_name,
+                    "class_name": class_name,
+                    "type": file_type,
+                    "doc_type": "class_summary",
+                    "element_name": class_name,
+                    "full_name": f"{package_name}.{class_name}"
+                }
+            )
+        return None
+    
+    def _extract_methods_documentation(self, soup: BeautifulSoup, class_name: str, 
+                                      package_name: str, file_type: str) -> List[Document]:
+        """Extract documentation for methods."""
+        documents = []
+        
+        # Find all method detail sections
+        method_sections = soup.select("section.detail")
+        
+        for section in method_sections:
+            # Check if this is a method section (not field or constructor)
+            if not section.select_one("h3:contains('Method Detail')"):
+                continue
+                
+            # Find all method details
+            methods = section.select("ul.blockList > li.blockList")
+            
+            for method in methods:
+                method_name = None
+                method_signature = None
+                method_desc = None
+                
+                # Get method name and signature
+                h4 = method.select_one("h4")
+                if h4:
+                    method_name = h4.text.strip()
+                    
+                pre = method.select_one("pre")
+                if pre:
+                    method_signature = pre.text.strip()
+                    
+                # Get method description
+                desc = method.select_one("div.block")
+                if desc:
+                    method_desc = desc.text.strip()
+                    
+                if method_name and (method_signature or method_desc):
+                    # Clean up method name (remove any type parameters)
+                    method_name = re.sub(r"<.*>", "", method_name).strip()
+                    
+                    content = f"METHOD: {method_name}\n\n"
+                    
+                    if method_signature:
+                        content += f"Signature: {method_signature}\n\n"
+                        
+                    if method_desc:
+                        content += f"Description: {method_desc}\n\n"
+                        
+                    # Extract parameter docs
+                    param_tags = method.select("dt:contains('Parameters:') ~ dd")
+                    if param_tags:
+                        content += "Parameters:\n"
+                        for param in param_tags:
+                            param_text = param.text.strip()
+                            param_name = param.select_one("span.paramName")
+                            if param_name:
+                                param_name = param_name.text.strip()
+                                param_desc = param_text.replace(param_name, "", 1).strip()
+                                content += f"- {param_name}: {param_desc}\n"
+                            else:
+                                content += f"- {param_text}\n"
+                        content += "\n"
+                        
+                    # Extract return doc
+                    return_tags = method.select("dt:contains('Returns:') ~ dd")
+                    if return_tags and return_tags[0]:
+                        content += f"Returns: {return_tags[0].text.strip()}\n\n"
+                        
+                    # Extract throws docs
+                    throws_tags = method.select("dt:contains('Throws:') ~ dd")
+                    if throws_tags:
+                        content += "Throws:\n"
+                        for throws in throws_tags:
+                            content += f"- {throws.text.strip()}\n"
+                        content += "\n"
+                    
+                    documents.append(Document(
+                        page_content=content,
+                        metadata={
+                            "package": package_name,
+                            "class_name": class_name,
+                            "type": file_type,
+                            "doc_type": "method",
+                            "element_name": method_name,
+                            "full_name": f"{package_name}.{class_name}.{method_name}"
+                        }
+                    ))
+        
+        return documents
+    
+    def _extract_fields_documentation(self, soup: BeautifulSoup, class_name: str, 
+                                     package_name: str, file_type: str) -> List[Document]:
+        """Extract documentation for fields."""
+        documents = []
+        
+        # Find field detail section
+        field_section = soup.select_one("section.field-details, section.detail:has(h3:contains('Field Detail'))")
+        if not field_section:
+            return []
+            
+        fields = field_section.select("ul.blockList > li.blockList")
+        
+        for field in fields:
+            field_name = None
+            field_type = None
+            field_desc = None
+            
+            # Get field name
+            h4 = field.select_one("h4")
+            if h4:
+                field_name = h4.text.strip()
+                
+            # Get field type and declaration
+            pre = field.select_one("pre")
+            if pre:
+                field_declaration = pre.text.strip()
+                # Try to extract type from declaration
+                match = re.search(r'(\w+(?:<.*>)?)\s+\w+', field_declaration)
+                if match:
+                    field_type = match.group(1)
+                    
+            # Get field description
+            desc = field.select_one("div.block")
+            if desc:
+                field_desc = desc.text.strip()
+                
+            if field_name:
+                content = f"FIELD: {field_name}\n\n"
+                
+                if field_type:
+                    content += f"Type: {field_type}\n\n"
+                    
+                if field_desc:
+                    content += f"Description: {field_desc}\n\n"
+                    
+                documents.append(Document(
+                    page_content=content,
+                    metadata={
+                        "package": package_name,
+                        "class_name": class_name,
+                        "type": file_type,
+                        "doc_type": "field",
+                        "element_name": field_name,
+                        "full_name": f"{package_name}.{class_name}.{field_name}"
+                    }
+                ))
+                
+        return documents
+    
+    def process_package_summary(self, package_file: Path, package_name: str) -> Optional[Document]:
+        """Extract package summary documentation."""
+        try:
+            with open(package_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            soup = BeautifulSoup(content, 'html5lib')
+            
+            # Find package description
+            package_desc = soup.select_one("div.block")
+            if not package_desc:
+                return None
+                
+            description = package_desc.text.strip()
+            if not description:
+                return None
+                
+            content = f"PACKAGE: {package_name}\n\n{description}"
+            
+            return Document(
+                page_content=content,
+                metadata={
+                    "package": package_name,
+                    "doc_type": "package_summary",
+                    "element_name": package_name,
+                    "full_name": package_name
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"Error processing package summary {package_file}: {e}")
+            return None
+    
+    def process_javadoc(self) -> List[Document]:
+        """Process the entire Javadoc directory and extract all documents."""
+        all_documents = []
+        package_structure = self.extract_package_structure()
+        
+        logger.info(f"Processing {len(package_structure)} packages")
+        
+        # Process each package
+        for package_name, files in package_structure.items():
+            logger.info(f"Processing package {package_name} with {len(files)} files")
+            
+            # Process package summary
+            package_summary_path = self.javadoc_path / "/".join(package_name.split(".")) / "package-summary.html"
+            if package_summary_path.exists():
+                package_doc = self.process_package_summary(package_summary_path, package_name)
+                if package_doc:
+                    all_documents.append(package_doc)
+            
+            # Process each file in the package
+            with ThreadPoolExecutor(max_workers=min(10, len(files))) as executor:
+                future_to_file = {
+                    executor.submit(self.process_file, file_path, package_name): file_path 
+                    for file_path in files
+                }
+                
+                for future in as_completed(future_to_file):
+                    file_path = future_to_file[future]
+                    try:
+                        documents = future.result()
+                        all_documents.extend(documents)
+                    except Exception as e:
+                        logger.error(f"Exception processing {file_path}: {e}")
+        
+        logger.info(f"Extracted {len(all_documents)} documents from Javadoc")
+        return all_documents
+
+
+def add_to_chroma_incrementally(chunks: List[Document], collection_name: str, persist_dir: str,
+                              model_id: str, region_name: str, batch_size: int = 10,
+                              aws_profile: Optional[str] = None):
+    """Create embeddings with Bedrock and store in Chroma incrementally."""
+    logger.info(f"Initializing Bedrock embeddings with model {model_id} in region {region_name}")
+    start_time = time.time()
+
+    # Initialize Bedrock embeddings
+    bedrock_kwargs = {
+        "model_id": model_id,
+        "region_name": region_name
+    }
+
+    if aws_profile:
+        bedrock_kwargs["credentials_profile_name"] = aws_profile
+        logger.info(f"Using AWS profile: {aws_profile}")
+
+    bedrock_embeddings = BedrockEmbeddings(**bedrock_kwargs)
+
+    # Initialize Chroma client
+    client = chromadb.PersistentClient(path=persist_dir)
+    
+    # Get or create collection
+    try:
+        collection = client.get_collection(name=collection_name)
+        logger.info(f"Using existing collection: {collection_name}")
+    except:
+        collection = client.create_collection(name=collection_name)
+        logger.info(f"Created new collection: {collection_name}")
+    
+    # Process chunks in batches
+    total_chunks = len(chunks)
+    total_batches = (total_chunks - 1) // batch_size + 1
+    successful_chunks = 0
+    failed_chunks = 0
+    
+    logger.info(f"Processing {total_chunks} documents in {total_batches} batches (batch size: {batch_size})")
+    
+    for i in range(0, total_chunks, batch_size):
+        batch = chunks[i:i+batch_size]
+        end_idx = min(i+batch_size, total_chunks)
+        batch_num = i//batch_size + 1
+        
+        batch_start_time = time.time()
+        logger.info(f"Processing batch {batch_num}/{total_batches} (chunks {i+1}-{end_idx} of {total_chunks})")
+        
+        # Create IDs for the documents
+        timestamp = int(time.time() * 1000)
+        ids = [f"doc_{timestamp}_{j}" for j in range(i, end_idx)]
+        
+        # Extract text and metadata
+        texts = [doc.page_content for doc in batch]
+        metadatas = [doc.metadata for doc in batch]
+        
+        # Generate embeddings and add to collection
+        try:
+            logger.info(f"Generating embeddings for batch {batch_num}...")
+            embedding_start = time.time()
+            embeddings = bedrock_embeddings.embed_documents(texts)
+            embedding_time = time.time() - embedding_start
+            logger.info(f"Embeddings generated in {embedding_time:.2f} seconds")
+            
+            logger.info(f"Adding documents to Chroma collection...")
+            add_start = time.time()
+            collection.add(
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+                ids=ids
+            )
+            add_time = time.time() - add_start
+            logger.info(f"Documents added in {add_time:.2f} seconds")
+            
+            successful_chunks += len(batch)
+            
+            batch_time = time.time() - batch_start_time
+            logger.info(f"Batch {batch_num}/{total_batches} completed in {batch_time:.2f} seconds")
+            
+            # Estimate remaining time
+            avg_time_per_batch = (time.time() - start_time) / batch_num
+            remaining_batches = total_batches - batch_num
+            est_remaining_time = avg_time_per_batch * remaining_batches
+            
+            # Format as hours:minutes:seconds
+            est_completion_time = datetime.now().timestamp() + est_remaining_time
+            est_completion_str = datetime.fromtimestamp(est_completion_time).strftime('%H:%M:%S')
+            
+            logger.info(f"Progress: {batch_num}/{total_batches} batches ({batch_num/total_batches*100:.1f}%)")
+            logger.info(f"Estimated time remaining: {est_remaining_time/60:.1f} minutes (completion around {est_completion_str})")
+            
+        except Exception as e:
+            logger.error(f"Error processing batch {batch_num}: {str(e)}")
+            failed_chunks += len(batch)
+            # Continue with next batch instead of failing completely
+            continue
+    
+    total_time = time.time() - start_time
+    logger.info(f"Processing completed in {total_time:.2f} seconds")
+    logger.info(f"Successfully added {successful_chunks} chunks to Chroma collection '{collection_name}'")
+    
+    if failed_chunks > 0:
+        logger.warning(f"Failed to process {failed_chunks} chunks")
+    
+    return collection
+
+
+def main():
+    """Main function to parse arguments and run the script."""
+    parser = argparse.ArgumentParser(
+        description="Import Javadoc to Chroma using Amazon Bedrock embeddings"
+    )
+
+    parser.add_argument(
+        "--javadoc", "-j",
+        required=True,
+        help="Path to the Javadoc directory to import"
+    )
+
+    parser.add_argument(
+        "--collection", "-c",
+        default="javadoc_collection",
+        help="Name of the Chroma collection (default: javadoc_collection)"
+    )
+
+    parser.add_argument(
+        "--persist-dir", "-d",
+        default="./chroma_db",
+        help="Directory to persist the Chroma database (default: ./chroma_db)"
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Number of documents to process in each batch (default: 10)"
+    )
+
+    parser.add_argument(
+        "--model-id",
+        default="amazon.titan-embed-text-v1",
+        choices=["amazon.titan-embed-text-v1", "cohere.embed-english-v3", "cohere.embed-multilingual-v3"],
+        help="Bedrock embedding model ID (default: amazon.titan-embed-text-v1)"
+    )
+
+    parser.add_argument(
+        "--region",
+        default="us-east-1",
+        help="AWS region for Bedrock (default: us-east-1)"
+    )
+
+    parser.add_argument(
+        "--profile",
+        help="AWS profile name (optional)"
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+
+    args = parser.parse_args()
+
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    try:
+        # Check if Javadoc directory exists
+        if not os.path.isdir(args.javadoc):
+            logger.error(f"Javadoc directory not found: {args.javadoc}")
+            return 1
+
+        # Create persist directory if it doesn't exist
+        os.makedirs(args.persist_dir, exist_ok=True)
+
+        # Process Javadoc
+        logger.info(f"Starting Javadoc processing from {args.javadoc}")
+        processor = JavadocProcessor(args.javadoc)
+        documents = processor.process_javadoc()
+        
+        if not documents:
+            logger.error("No documents extracted from Javadoc")
+            return 1
+        
+        logger.info(f"Extracted {len(documents)} documents, adding to Chroma...")
+
+        # Add documents to Chroma incrementally
+        add_to_chroma_incrementally(
+            documents,
+            args.collection,
+            args.persist_dir,
+            args.model_id,
+            args.region,
+            args.batch_size,
+            args.profile
+        )
+
+        logger.info("Javadoc successfully imported to Chroma.")
+        return 0
+
+    except Exception as e:
+        logger.error(f"Error importing Javadoc: {str(e)}", exc_info=True)
+        return 1
+
+if __name__ == "__main__":
+    exit(main())
